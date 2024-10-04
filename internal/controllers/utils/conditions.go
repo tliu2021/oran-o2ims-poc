@@ -22,6 +22,7 @@ var PRconditionTypes = struct {
 	Validated                ConditionType
 	HardwareTemplateRendered ConditionType
 	HardwareProvisioned      ConditionType
+	HardwareConfigured       ConditionType
 	ClusterInstanceRendered  ConditionType
 	ClusterResourcesCreated  ConditionType
 	ClusterInstanceProcessed ConditionType
@@ -31,6 +32,7 @@ var PRconditionTypes = struct {
 	Validated:                "ProvisioningRequestValidated",
 	HardwareTemplateRendered: "HardwareTemplateRendered",
 	HardwareProvisioned:      "HardwareProvisioned",
+	HardwareConfigured:       "HardwareConfigured",
 	ClusterInstanceRendered:  "ClusterInstanceRendered",
 	ClusterResourcesCreated:  "ClusterResourcesCreated",
 	ClusterInstanceProcessed: "ClusterInstanceProcessed",
