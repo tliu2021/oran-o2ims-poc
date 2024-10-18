@@ -87,6 +87,9 @@ spec:
         path: version
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
+      statusDescriptors:
+      - displayName: Conditions
+        path: conditions
       version: v1alpha1
     - description: Inventory is the Schema for the Inventory API
       displayName: ORAN O2IMS Inventory
@@ -101,6 +104,14 @@ spec:
           the alarm server.
         displayName: Alarm Subscription Server Configuration
         path: alarmSubscriptionServerConfig
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: |-
+          CaBundleName references a config map that contains a set of custom CA certificates to be used when communicating
+          with any outside entity (e.g., the SMO, the authorization server, etc.) that has its TLS certificate signed by
+          a non-public CA certificate.
+        displayName: Custom CA Certificates
+        path: caBundleName
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
       - description: CloudId is used to correlate the SMO inventory record with the
@@ -150,6 +161,53 @@ spec:
         path: resourceServerConfig.extensions
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
+      - description: SmoConfig defines the configurable attributes to represent the
+          SMO instance
+        displayName: SMO Configuration
+        path: smo
+      - description: OAuthConfig defines the configurable attributes required to access
+          the OAuth2 authorization server
+        displayName: SMO OAuth Configuration
+        path: smo.oauth
+      - description: |-
+          ClientSecretName represents the name of a secret (in the current namespace) which contains the client-id and
+          client-secret values used by the OAuth client.
+        displayName: Client Secret
+        path: smo.oauth.clientSecretName
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: |-
+          Scopes represents the OAuth scope values to request when acquiring a token.  Typically, this should be set to
+          "openid" in addition to any other scopes that the SMO specifically requires (e.g., "roles", "groups", etc...) to
+          authorize our requests
+        displayName: OAuth Scopes
+        path: smo.oauth.scopes
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: |-
+          TokenEndpoint represents the API endpoint used to acquire a token (e.g., /protocol/openid-connect/token) which
+          will be appended to the base URL to form the full URL
+        displayName: OAuth Token Endpoint
+        path: smo.oauth.tokenEndpoint
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: Url represents the base URL of the authorization server. (e.g.,
+          https://keycloak.example.com/realms/oran)
+        displayName: OAuth URL
+        path: smo.oauth.url
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: RegistrationEndpoint represents the API endpoint used to register
+          the O2IMS with the SMO.
+        displayName: Registration API Endpoint
+        path: smo.registrationEndpoint
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: Url represents the base URL of the SMO instance
+        displayName: SMO URL
+        path: smo.url
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
       statusDescriptors:
       - description: |-
           INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
@@ -184,16 +242,36 @@ spec:
         path: cloudID
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
+      - description: HwMgrId is the identifier for the hardware manager plugin adaptor.
+        displayName: Hardware Manager ID
+        path: hwMgrId
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
       - description: Location
         displayName: Location
         path: location
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
+      - displayName: Node Group
+        path: nodeGroup
       - description: Site
         displayName: Site
         path: site
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
+      statusDescriptors:
+      - displayName: Cloud Manager
+        path: cloudManager
+      - description: |-
+          Conditions represent the observations of the NodePool's current state.
+          Possible values of the condition type are `Provisioned` and `Unknown`.
+        displayName: Conditions
+        path: conditions
+      - displayName: Hw Mgr Plugin
+        path: hwMgrPlugin
+      - description: Properties represent the node properties in the pool
+        displayName: Properties
+        path: properties
       version: v1alpha1
     - description: Node is the schema for an allocated node
       displayName: Node
@@ -219,6 +297,18 @@ spec:
         path: nodePool
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
+      statusDescriptors:
+      - displayName: BMC
+        path: bmc
+      - description: |-
+          Conditions represent the observations of the NodeStatus's current state.
+          Possible values of the condition type are `Provisioned`, `Unprovisioned`, `Updating` and `Failed`.
+        displayName: Conditions
+        path: conditions
+      - displayName: Hostname
+        path: hostname
+      - displayName: Interfaces
+        path: interfaces
       version: v1alpha1
     - description: ProvisioningRequest is the Schema for the provisioningrequests
         API
@@ -233,18 +323,22 @@ spec:
         name: ""
         version: v1
       specDescriptors:
-      - displayName: Cluster Template Input
-        path: clusterTemplateInput
+      - description: Description specifies a brief description of this provisioning
+          request, providing additional context or details.
+        displayName: Description
+        path: description
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
-      - description: Location
-        displayName: Location
-        path: location
+      - description: Extensions holds additional custom key-value pairs that can be
+          used to extend the cluster's configuration.
+        displayName: Extensions
+        path: extensions
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
-      - description: Site
-        displayName: Site
-        path: site
+      - description: Name specifies a human-readable name for this provisioning request,
+          intended for identification and descriptive purposes.
+        displayName: Name
+        path: name
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
       - description: |-
@@ -254,6 +348,12 @@ spec:
         path: templateName
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
+      - description: TemplateParameters provides the input data that conforms to the
+          OpenAPI v3 schema defined in the referenced ClusterTemplate's spec.templateParameterSchema.
+        displayName: Template Parameters
+        path: templateParameters
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
       - description: |-
           TemplateVersion defines the version of the referenced ClusterTemplate.
           The full name of the ClusterTemplate is constructed as <TemplateName.TemplateVersion>.
@@ -261,10 +361,19 @@ spec:
         path: templateVersion
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
-      - displayName: Timeout
-        path: timeout
-        x-descriptors:
-        - urn:alm:descriptor:com.tectonic.ui:text
+      statusDescriptors:
+      - description: ClusterDetails references to the ClusterInstance.
+        displayName: Cluster Details
+        path: clusterDetails
+      - displayName: Conditions
+        path: conditions
+      - description: NodePoolRef references to the NodePool.
+        displayName: Node Pool Ref
+        path: nodePoolRef
+      - description: Holds policies that are matched with the ManagedCluster created
+          by the ProvisioningRequest.
+        displayName: Policies
+        path: policies
       version: v1alpha1
   description: |
     # O-RAN O2IMS operator
@@ -303,6 +412,7 @@ spec:
   - email: imihai@redhat.com
     name: IrinaMihai
   maturity: alpha
+  minKubeVersion: 1.28.0
   provider:
     name: Red Hat
   replaces: oran-o2ims.v0.0.0

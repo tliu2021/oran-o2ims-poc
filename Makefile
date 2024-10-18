@@ -22,6 +22,16 @@ ginkgo_flags:=
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
 VERSION ?= 4.16.0
 
+ifeq (${DEBUG}, yes)
+	DOCKER_TARGET = debug
+	GOBUILD_GCFLAGS = all=-N -l
+	KUSTOMIZE_OVERLAY = debug
+else
+	DOCKER_TARGET = production
+	GOBUILD_GCFLAGS = ""
+	KUSTOMIZE_OVERLAY = default
+endif
+
 # DEFAULT_CHANNEL defines the default channel used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g DEFAULT_CHANNEL = "stable")
 # To re-generate a bundle for any other default channel without changing the default setup, you can:
@@ -115,17 +125,17 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+manifests: deps-update controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
 .PHONY: generate
-generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+generate: deps-update controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 ##@ Build
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build
+	go build -gcflags "${GOBUILD_GCFLAGS}"
 
 .PHONY: run
 run: manifests generate fmt vet binary ## Run a controller from your host.
@@ -135,11 +145,11 @@ run: manifests generate fmt vet binary ## Run a controller from your host.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} -f Dockerfile .
+docker-build: manifests generate fmt vet ## Build docker image with the manager.
+	$(CONTAINER_TOOL) build -t ${IMG} -f Dockerfile --target ${DOCKER_TARGET} --build-arg "GOBUILD_GCFLAGS=${GOBUILD_GCFLAGS}" .
 
 .PHONY: docker-push
-docker-push: ## Push docker image with the manager.
+docker-push: docker-build ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
@@ -177,11 +187,11 @@ uninstall: manifests kustomize kubectl ## Uninstall CRDs from the K8s cluster sp
 deploy: manifests kustomize kubectl ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	@$(KUBECTL) create configmap env-config --from-literal=HWMGR_PLUGIN_NAMESPACE=$(HWMGR_PLUGIN_NAMESPACE) --dry-run=client -o yaml > config/manager/env-config.yaml
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
+	$(KUSTOMIZE) build config/$(KUSTOMIZE_OVERLAY) | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize kubectl ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+	$(KUSTOMIZE) build config/$(KUSTOMIZE_OVERLAY) | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
 ##@ Build Dependencies
 
@@ -256,16 +266,30 @@ bundle: operator-sdk manifests kustomize kubectl ## Generate bundle manifests an
 	sed -i '/^[[:space:]]*createdAt:/d' bundle/manifests/oran-o2ims.clusterserviceversion.yaml
 
 .PHONY: bundle-build
-bundle-build: bundle ## Build the bundle image.
+bundle-build: bundle docker-push ## Build the bundle image.
 	$(CONTAINER_TOOL) build -f bundle.Dockerfile -t $(BUNDLE_IMG) .
 
 .PHONY: bundle-push
-bundle-push: ## Push the bundle image.
-	$(MAKE) docker-push IMG=$(BUNDLE_IMG)
+bundle-push: bundle-build ## Push the bundle image.
+	$(CONTAINER_TOOL) push $(BUNDLE_IMG)
 
 .PHONY: bundle-check
 bundle-check: bundle
 	hack/check-git-tree.sh
+
+.PHONY: bundle-run
+bundle-run: # Install bundle on cluster using operator sdk.
+	oc create ns $(OCLOUD_MANAGER_NAMESPACE)
+	$(OPERATOR_SDK) --security-context-config restricted -n $(OCLOUD_MANAGER_NAMESPACE) run bundle $(BUNDLE_IMG)
+
+.PHONY: bundle-upgrade
+bundle-upgrade: # Upgrade bundle on cluster using operator sdk.
+	$(OPERATOR_SDK) run bundle-upgrade $(BUNDLE_IMG)
+
+.PHONY: bundle-clean
+bundle-clean: # Uninstall bundle on cluster using operator sdk.
+	$(OPERATOR_SDK) cleanup oran-o2ims -n $(OCLOUD_MANAGER_NAMESPACE)
+	oc delete ns $(OCLOUD_MANAGER_NAMESPACE)
 
 .PHONY: opm
 OPM = ./bin/opm
@@ -364,4 +388,10 @@ clean:
 .PHONY: scorecard-test
 scorecard-test: operator-sdk
 	@test -n "$(KUBECONFIG)" || (echo "The environment variable KUBECONFIG must not empty" && false)
-	$(OPERATOR_SDK) scorecard bundle -o text --kubeconfig "$(KUBECONFIG)" -n $(OCLOUD_MANAGER_NAMESPACE)
+	oc create ns $(OCLOUD_MANAGER_NAMESPACE) --dry-run=client -o yaml | oc apply -f -
+	$(OPERATOR_SDK) scorecard bundle -o text --kubeconfig "$(KUBECONFIG)" -n $(OCLOUD_MANAGER_NAMESPACE) --pod-security=restricted
+
+.PHONY: sync-submodules
+sync-submodules:
+	@echo "Syncing submodules"
+	hack/sync-submodules.sh

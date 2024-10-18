@@ -1,5 +1,7 @@
 package utils
 
+import "time"
+
 // Default namespace
 const (
 	InventoryNamespace = "oran-o2ims"
@@ -68,13 +70,35 @@ const (
 	defaultServiceCAFile    = "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt" // nolint: gosec // hardcoded path only
 )
 
+// Default timeout values
+const (
+	DefaultHardwareProvisioningTimeout = 90 * time.Minute
+	DefaultClusterProvisioningTimeout  = 90 * time.Minute
+	DefaultClusterConfigurationTimeout = 30 * time.Minute
+)
+
+// These are optional keys in the respective ConfigMaps defined in ClusterTemplate
+// spec.templates, used to configure the timeout values for each operation.
+// If not specified, the default timeout values will be applied.
+const (
+	HardwareProvisioningTimeoutConfigKey = "hardwareProvisioningTimeout"
+	ClusterProvisioningTimeoutConfigKey  = "clusterProvisioningTimeout"
+	ClusterConfigurationTimeoutConfigKey = "clusterConfigurationTimeout"
+)
+
+// Required template schema parameters
+const (
+	TemplateParamNodeClusterName = "nodeClusterName"
+	TemplateParamOCloudSiteId    = "oCloudSiteId"
+	TemplateParamClusterInstance = "clusterInstanceParameters"
+	TemplateParamPolicyConfig    = "policyTemplateParameters"
+)
+
 // ClusterInstance template constants
 const (
 	ClusterInstanceTemplateName                 = "ClusterInstance"
 	ClusterInstanceTemplatePath                 = "controllers/clusterinstance-template.yaml"
-	ClusterInstanceTemplateConfigmapName        = "sc-clusterinstance-template"
 	ClusterInstanceTemplateDefaultsConfigmapKey = "clusterinstance-defaults"
-	clusterInstanceParameters                   = "clusterInstanceParameters"
 )
 
 var (
@@ -103,25 +127,13 @@ var (
 // PolicyTemplate constants
 const (
 	PolicyTemplateDefaultsConfigmapKey = "policytemplate-defaults"
-	PolicyTemplateParameters           = "policyTemplateParameters"
 	ClusterVersionLabelKey             = "cluster-version"
 )
 
-// ClusterInstance status
+// Cluster status
 const (
-	ClusterInstalling = "In progress"
-	ClusterCompleted  = "Completed"
-	ClusterFailed     = "Failed"
 	ClusterZtpDone    = "ZTP Done"
 	ClusterZtpNotDone = "ZTP Not Done"
-)
-
-// Hardware Provisioning status
-const (
-	HardwareProvisioningInProgress = "InProgress"
-	HardwareProvisioningCompleted  = "Completed"
-	HardwareProvisioningFailed     = "Failed"
-	HardwareProvisioningUnknown    = "Unknown"
 )
 
 // Hardeware template constants
@@ -129,11 +141,6 @@ const (
 	HwTemplatePluginMgr      = "hwMgrId"
 	HwTemplateNodePool       = "node-pools-data"
 	HwTemplateBootIfaceLabel = "bootInterfaceLabel"
-)
-
-const (
-	ClusterInstanceDataType = "ClusterInstance"
-	PolicyTemplateDataType  = "PolicyTemplate"
 )
 
 const (
@@ -175,3 +182,6 @@ const (
 	KubeRbacProxyImageName = "KUBE_RBAC_PROXY_IMAGE"
 	HwMgrPluginNameSpace   = "HWMGR_PLUGIN_NAMESPACE"
 )
+
+// ClusterVersionName is the name given to the default ClusterVersion object
+const ClusterVersionName = "version"

@@ -43,8 +43,10 @@ type NodePoolSpec struct {
 	LocationSpec `json:",inline"`
 
 	// HwMgrId is the identifier for the hardware manager plugin adaptor.
+	//+operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Hardware Manager ID",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	HwMgrId string `json:"hwMgrId,omitempty"`
 
+	//+operator-sdk:csv:customresourcedefinitions:type=spec
 	NodeGroup []NodeGroup `json:"nodeGroup"`
 }
 
@@ -69,21 +71,28 @@ type GenerationStatus struct {
 // a node that will eventually be part of a deployment manager.
 type NodePoolStatus struct {
 	// Properties represent the node properties in the pool
+	//+operator-sdk:csv:customresourcedefinitions:type=status
 	Properties Properties `json:"properties,omitempty"`
 
 	// Conditions represent the observations of the NodePool's current state.
 	// Possible values of the condition type are `Provisioned` and `Unknown`.
+	//+operator-sdk:csv:customresourcedefinitions:type=status
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
 
+	//+operator-sdk:csv:customresourcedefinitions:type=status
 	CloudManager GenerationStatus `json:"cloudManager,omitempty"`
-	HwMgrPlugin  GenerationStatus `json:"hwMgrPlugin,omitempty"`
+
+	//+operator-sdk:csv:customresourcedefinitions:type=status
+	HwMgrPlugin GenerationStatus `json:"hwMgrPlugin,omitempty"`
 }
 
 // NodePool is the schema for an allocation request of nodes
 //
-// +kubebuilder:resource:shortName=np
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:path=nodepools,shortName=orannp
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:printcolumn:name="State",type="string",JSONPath=".status.conditions[-1:].reason"
 // +operator-sdk:csv:customresourcedefinitions:displayName="Node Pool",resources={{Namespace, v1}}
 type NodePool struct {
 	metav1.TypeMeta   `json:",inline"`

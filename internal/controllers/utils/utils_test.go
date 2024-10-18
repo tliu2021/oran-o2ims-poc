@@ -22,6 +22,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	inventoryv1alpha1 "github.com/openshift-kni/oran-o2ims/api/inventory/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,8 +34,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
-
-	inventoryv1alpha1 "github.com/openshift-kni/oran-o2ims/api/inventory/v1alpha1"
 )
 
 // Scheme used for the tests:
@@ -888,6 +887,8 @@ var testClusterInstanceData = map[string]interface{}{
 			"bmcCredentialsName":     map[string]interface{}{"name": "node1-bmc-secret"},
 			"bootMACAddress":         "00:00:00:01:20:30",
 			"bootMode":               "UEFI",
+			"extraLabels":            map[string]map[string]string{"NMStateConfig": {"labelKey": "labelValue"}},
+			"extraAnnotations":       map[string]map[string]string{"NMStateConfig": {"annKey": "annValue"}},
 			"hostName":               "node1.baseDomain.com",
 			"ignitionConfigOverride": "{\"ignition\": {\"version\": \"3.1.0\"}, \"storage\": {\"files\": [{\"path\": \"/etc/containers/registries.conf\", \"overwrite\": true, \"contents\": {\"source\": \"data:text/plain;base64,aGVsbG8gZnJvbSB6dHAgcG9saWN5IGdlbmVyYXRvcg==\"}}]}}",
 			"installerArgs":          "[\"--append-karg\", \"nameserver=8.8.8.8\", \"-n\"]",
@@ -1034,6 +1035,12 @@ spec:
       name: node1-bmc-secret
     bootMACAddress: "00:00:00:01:20:30"
     bootMode: UEFI
+    extraLabels:
+      NMStateConfig:
+        labelKey: labelValue
+    extraAnnotations:
+      NMStateConfig:
+        annKey: annValue
     hostName: node1.baseDomain.com
     ignitionConfigOverride: '{"ignition": {"version": "3.1.0"}, "storage": {"files":
       [{"path": "/etc/containers/registries.conf", "overwrite": true, "contents":
@@ -2139,7 +2146,7 @@ func TestExtractSubSchema(t *testing.T) {
 	tests := []struct {
 		name          string
 		args          args
-		wantSubSchema []byte
+		wantSubSchema map[string]any
 		wantErr       bool
 	}{
 		{
@@ -2148,8 +2155,17 @@ func TestExtractSubSchema(t *testing.T) {
 				mainSchema: []byte(testTemplate),
 				node:       "clusterInstanceParameters",
 			},
-			wantSubSchema: []byte(`{"description":"clusterInstanceParameters.","properties":{"additionalNTPSources":{"description":"AdditionalNTPSources.","items":{"type":"string"},"type":"array"}}}`),
-			wantErr:       false,
+			wantSubSchema: map[string]any{
+				"description": "clusterInstanceParameters.",
+				"properties": map[string]any{
+					"additionalNTPSources": map[string]any{
+						"description": "AdditionalNTPSources.",
+						"items":       map[string]any{"type": "string"},
+						"type":        "array",
+					},
+				},
+			},
+			wantErr: false,
 		},
 	}
 	for _, tt := range tests {
@@ -2161,6 +2177,96 @@ func TestExtractSubSchema(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotSubSchema, tt.wantSubSchema) {
 				t.Errorf("ExtractSubSchema() = %v, want %v", gotSubSchema, tt.wantSubSchema)
+			}
+		})
+	}
+}
+
+func TestExtractMatchingInput(t *testing.T) {
+	type args struct {
+		input        []byte
+		subSchemaKey string
+	}
+	tests := []struct {
+		name              string
+		args              args
+		wantMatchingInput any
+		wantErr           bool
+	}{
+		{
+			name: "ok - valid map input",
+			args: args{
+				input: []byte(`{
+					"clusterInstanceParameters": {
+						"additionalNTPSources": ["1.1.1.1"]
+					}
+				}`),
+				subSchemaKey: "clusterInstanceParameters",
+			},
+			wantMatchingInput: map[string]any{
+				"additionalNTPSources": []any{"1.1.1.1"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "ok - valid string input",
+			args: args{
+				input: []byte(`{
+  "required": [
+    "nodeClusterName",
+    "oCloudSiteId",
+    "policyTemplateParameters",
+    "clusterInstanceParameters"
+  ]
+}`),
+				subSchemaKey: "required",
+			},
+			wantMatchingInput: []any{"nodeClusterName", "oCloudSiteId", "policyTemplateParameters", "clusterInstanceParameters"},
+			wantErr:           false,
+		},
+		{
+			name: "ok - valid string input",
+			args: args{
+				input: []byte(`{
+					"oCloudSiteId": "local-123"
+				}`),
+				subSchemaKey: "oCloudSiteId",
+			},
+			wantMatchingInput: "local-123",
+			wantErr:           false,
+		},
+		{
+			name: "error - missing subSchemaKey",
+			args: args{
+				input: []byte(`{
+					"clusterInstanceParameters": {
+						"additionalNTPSources": ["1.1.1.1"]
+					}
+				}`),
+				subSchemaKey: "oCloudSiteId",
+			},
+			wantMatchingInput: nil,
+			wantErr:           true,
+		},
+		{
+			name: "error - invalid JSON",
+			args: args{
+				input:        []byte(`{invalid JSON}`),
+				subSchemaKey: "clusterInstance",
+			},
+			wantMatchingInput: nil,
+			wantErr:           true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotMatchingInput, err := ExtractMatchingInput(tt.args.input, tt.args.subSchemaKey)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ExtractMatchingInput() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(gotMatchingInput, tt.wantMatchingInput) {
+				t.Errorf("ExtractMatchingInput() = %s, want %s", gotMatchingInput, tt.wantMatchingInput)
 			}
 		})
 	}
@@ -2187,6 +2293,46 @@ func Test_mapKeysToSlice(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := MapKeysToSlice(tt.args.inputMap); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("mapKeysToSlice() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractSchemaRequired(t *testing.T) {
+	type args struct {
+		mainSchema []byte
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    []string
+		wantErr bool
+	}{
+		{
+			name: "ok",
+			args: args{
+				mainSchema: []byte(`{
+					"required": [
+					  "nodeClusterName",
+					  "oCloudSiteId",
+					  "policyTemplateParameters",
+					  "clusterInstanceParameters"
+					]
+				  }`),
+			},
+			want:    []string{"nodeClusterName", "oCloudSiteId", "policyTemplateParameters", "clusterInstanceParameters"},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ExtractSchemaRequired(tt.args.mainSchema)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ExtractSchemaRequired() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ExtractSchemaRequired() = %v, want %v", got, tt.want)
 			}
 		})
 	}

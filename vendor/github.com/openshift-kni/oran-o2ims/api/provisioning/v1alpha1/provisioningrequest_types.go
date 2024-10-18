@@ -17,7 +17,6 @@ limitations under the License.
 package v1alpha1
 
 import (
-	hwv1alpha1 "github.com/openshift-kni/oran-o2ims/api/hardwaremanagement/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -30,8 +29,13 @@ type ProvisioningRequestSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	//+operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Location Spec",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
-	hwv1alpha1.LocationSpec `json:",inline"`
+	// Name specifies a human-readable name for this provisioning request, intended for identification and descriptive purposes.
+	//+operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Name",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
+	Name string `json:"name,omitempty"`
+
+	// Description specifies a brief description of this provisioning request, providing additional context or details.
+	//+operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Description",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
+	Description string `json:"description,omitempty"`
 
 	// TemplateName defines the base name of the referenced ClusterTemplate.
 	// The full name of the ClusterTemplate is constructed as <TemplateName.TemplateVersion>.
@@ -43,28 +47,13 @@ type ProvisioningRequestSpec struct {
 	//+operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Template Version",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	TemplateVersion string `json:"templateVersion"`
 
-	//+operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Cluster Template Input",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
-	ClusterTemplateInput ClusterTemplateInput `json:"clusterTemplateInput"`
+	// TemplateParameters provides the input data that conforms to the OpenAPI v3 schema defined in the referenced ClusterTemplate's spec.templateParameterSchema.
+	//+operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Template Parameters",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
+	TemplateParameters runtime.RawExtension `json:"templateParameters"`
 
-	//+operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Timeout",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
-	Timeout Timeout `json:"timeout,omitempty"`
-}
-
-// ClusterTemplateInput provides the input data that follows the schema defined in the referenced ClusterTemplate.
-type ClusterTemplateInput struct {
-	// ClusterInstanceInput provides the input values required for provisioning.
-	// The input must adhere to the schema defined in the referenced ClusterTemplate's
-	// spec.inputDataSchema.clusterInstanceSchema.
-	// +kubebuilder:validation:Type=object
-	// +kubebuilder:pruning:PreserveUnknownFields
-	ClusterInstanceInput runtime.RawExtension `json:"clusterInstanceInput"`
-
-	// PolicyTemplateInput provides input values for ACM configuration policies.
-	// The input follows the schema defined in the referenced ClusterTemplate's
-	// spec.inputDataSchema.policyTemplateSchema.
-	// +kubebuilder:validation:Type=object
-	// +kubebuilder:pruning:PreserveUnknownFields
-	PolicyTemplateInput runtime.RawExtension `json:"policyTemplateInput"`
+	// Extensions holds additional custom key-value pairs that can be used to extend the cluster's configuration.
+	//+operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Extensions",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
+	Extensions runtime.RawExtension `json:"extensions,omitempty"`
 }
 
 // NodePoolRef references a node pool.
@@ -91,20 +80,6 @@ type ClusterDetails struct {
 	NonCompliantAt metav1.Time `json:"nonCompliantAt,omitempty"`
 }
 
-// Timeout contains timeout values for hardware provisioning, cluster provisioning and
-// cluster configuration.
-type Timeout struct {
-	// ClusterProvisioning defines the timeout for the initial cluster installation in minutes.
-	//+kubebuilder:default=90
-	ClusterProvisioning int `json:"clusterProvisioning,omitempty"`
-	// HardwareProvisioning defines the timeout for the hardware provisioning in minutes.
-	//+kubebuilder:default=90
-	HardwareProvisioning int `json:"hardwareProvisioning,omitempty"`
-	// Configuration defines the timeout for ACM policy configuration.
-	//+kubebuilder:default=30
-	Configuration int `json:"configuration,omitempty"`
-}
-
 // PolicyDetails holds information about an ACM policy.
 type PolicyDetails struct {
 	// The compliance of the ManagedCluster created through a ProvisioningRequest with the current
@@ -118,26 +93,69 @@ type PolicyDetails struct {
 	RemediationAction string `json:"remediationAction,omitempty"`
 }
 
+// ProvisioningState defines the various states of the provisioning process.
+type ProvisioningState string
+
+const (
+	// StateProgressing means the provisioning process is currently in progress.
+	// It could be in progress during hardware provisioning, cluster installation, or cluster configuration.
+	StateProgressing ProvisioningState = "progressing"
+
+	// StateFulfilled means the provisioning process has been successfully completed for all stages.
+	StateFulfilled ProvisioningState = "fulfilled"
+
+	// StateFailed means the provisioning process has failed at any stage, including resource validation
+	// and preparation prior to provisioning, hardware provisioning, cluster installation, or cluster configuration.
+	StateFailed ProvisioningState = "failed"
+)
+
+// ProvisionedResources contains the resources that were provisioned as part of the provisioning process.
+type ProvisionedResources struct {
+	// The identifier of the provisioned oCloud Node Cluster.
+	OCloudNodeClusterId string `json:"oCloudNodeClusterId,omitempty"`
+}
+
+type ProvisioningStatus struct {
+	// The current state of the provisioning process.
+	// +kubebuilder:validation:Enum=progressing;fulfilled;failed
+	ProvisioningState ProvisioningState `json:"provisioningState,omitempty"`
+
+	// The details about the current state of the provisioning process.
+	ProvisioningDetails string `json:"provisioningDetails,omitempty"`
+
+	// The resources that have been successfully provisioned as part of the provisioning process.
+	ProvisionedResources *ProvisionedResources `json:"provisionedResources,omitempty"`
+}
+
 // ProvisioningRequestStatus defines the observed state of ProvisioningRequest
 type ProvisioningRequestStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
+	//+operator-sdk:csv:customresourcedefinitions:type=status
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
 	// ClusterDetails references to the ClusterInstance.
+	//+operator-sdk:csv:customresourcedefinitions:type=status
 	ClusterDetails *ClusterDetails `json:"clusterDetails,omitempty"`
 
 	// NodePoolRef references to the NodePool.
+	//+operator-sdk:csv:customresourcedefinitions:type=status
 	NodePoolRef *NodePoolRef `json:"nodePoolRef,omitempty"`
 
 	// Holds policies that are matched with the ManagedCluster created by the ProvisioningRequest.
+	//+operator-sdk:csv:customresourcedefinitions:type=status
 	Policies []PolicyDetails `json:"policies,omitempty"`
+
+	ProvisioningStatus ProvisioningStatus `json:"provisioningStatus,omitempty"`
 }
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
-//+kubebuilder:resource:scope=Cluster
+//+kubebuilder:resource:scope=Cluster,shortName=oranpr
+//+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+//+kubebuilder:printcolumn:name="ProvisionState",type="string",JSONPath=".status.provisioningStatus.provisioningState"
+//+kubebuilder:printcolumn:name="ProvisionDetails",type="string",JSONPath=".status.provisioningStatus.provisioningDetails"
 
 // ProvisioningRequest is the Schema for the provisioningrequests API
 // +operator-sdk:csv:customresourcedefinitions:displayName="ORAN O2IMS Provisioning Request",resources={{Namespace, v1},{ClusterInstance, siteconfig.open-cluster-management.io/v1alpha1}}

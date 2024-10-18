@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -144,9 +145,9 @@ clustertemplate-a-policy-v1-defaultHugepagesSize: "1G"`,
 		Expect(conditions[0].Status).To(Equal(metav1.ConditionFalse))
 		Expect(conditions[0].Reason).To(Equal(string(utils.CTconditionReasons.Failed)))
 		Expect(conditions[0].Message).To(ContainSubstring(fmt.Sprintf(
-			"the ConfigMap %s is not found in the namespace %s", ciDefaultsCm, ctNamespace)))
+			"the ConfigMap '%s' is not found in the namespace '%s'", ciDefaultsCm, ctNamespace)))
 		Expect(conditions[0].Message).To(ContainSubstring(fmt.Sprintf(
-			"the ConfigMap %s is not found in the namespace %s", ptDefaultsCm, ctNamespace)))
+			"the ConfigMap '%s' is not found in the namespace '%s'", ptDefaultsCm, ctNamespace)))
 	})
 })
 
@@ -257,6 +258,7 @@ var _ = Describe("validateClusterTemplateCR", func() {
 	var (
 		c            client.Client
 		ctx          context.Context
+		cms          []*corev1.ConfigMap
 		tName        = "cluster-template-a"
 		tVersion     = "v1.0.0"
 		ctNamespace  = "cluster-template-a"
@@ -281,26 +283,19 @@ var _ = Describe("validateClusterTemplateCR", func() {
 					PolicyTemplateDefaults:  ptDefaultsCm,
 					HwTemplate:              hwTemplateCm,
 				},
+				TemplateParameterSchema: runtime.RawExtension{Raw: []byte(testFullTemplateSchema)},
 			},
 		}
 
-		c = getFakeClientFromObjects([]client.Object{ct}...)
-		t = &clusterTemplateReconcilerTask{
-			client: c,
-			logger: logger,
-			object: ct,
-		}
-	})
-
-	It("should validate a valid ClusterTemplate and set status condition to true", func() {
-		// Create valid ConfigMaps
-		cms := []*corev1.ConfigMap{
+		// Valid ConfigMaps
+		cms = []*corev1.ConfigMap{
 			{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      ciDefaultsCm,
 					Namespace: ctNamespace,
 				},
 				Data: map[string]string{
+					utils.ClusterProvisioningTimeoutConfigKey: "80m",
 					utils.ClusterInstanceTemplateDefaultsConfigmapKey: `
 key: value`,
 				},
@@ -311,6 +306,7 @@ key: value`,
 					Namespace: ctNamespace,
 				},
 				Data: map[string]string{
+					utils.ClusterConfigurationTimeoutConfigKey: "40m",
 					utils.PolicyTemplateDefaultsConfigmapKey: `
 clustertemplate-a-policy-v1-cpu-isolated: "2-31"
 clustertemplate-a-policy-v1-cpu-reserved: "0-1"
@@ -331,6 +327,16 @@ clustertemplate-a-policy-v1-defaultHugepagesSize: "1G"`,
 				},
 			},
 		}
+
+		c = getFakeClientFromObjects([]client.Object{ct}...)
+		t = &clusterTemplateReconcilerTask{
+			client: c,
+			logger: logger,
+			object: ct,
+		}
+	})
+
+	It("should validate a valid ClusterTemplate and set status condition to true", func() {
 		for _, cm := range cms {
 			Expect(c.Create(ctx, cm)).To(Succeed())
 		}
@@ -361,9 +367,35 @@ clustertemplate-a-policy-v1-defaultHugepagesSize: "1G"`,
 		Expect(conditions[0].Status).To(Equal(metav1.ConditionFalse))
 		Expect(conditions[0].Reason).To(Equal(string(utils.CTconditionReasons.Failed)))
 		Expect(conditions[0].Message).To(ContainSubstring(fmt.Sprintf(
-			"the ConfigMap %s is not found in the namespace %s", ciDefaultsCm, ctNamespace)))
+			"the ConfigMap '%s' is not found in the namespace '%s'", ciDefaultsCm, ctNamespace)))
 		Expect(conditions[0].Message).To(ContainSubstring(fmt.Sprintf(
-			"the ConfigMap %s is not found in the namespace %s", ptDefaultsCm, ctNamespace)))
+			"the ConfigMap '%s' is not found in the namespace '%s'", ptDefaultsCm, ctNamespace)))
+	})
+
+	It("should return false and set status condition to false if timeouts in ConfigMaps are invalid", func() {
+		cms[0].Data[utils.ClusterProvisioningTimeoutConfigKey] = "invalidCiTimeout"
+		cms[1].Data[utils.ClusterConfigurationTimeoutConfigKey] = "invalidPtTimeout"
+		cms[2].Data[utils.HardwareProvisioningTimeoutConfigKey] = "40"
+		for _, cm := range cms {
+			Expect(c.Create(ctx, cm)).To(Succeed())
+		}
+
+		valid, err := t.validateClusterTemplateCR(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(valid).To(BeFalse())
+
+		// Check the status condition
+		conditions := t.object.Status.Conditions
+		Expect(conditions).To(HaveLen(1))
+		Expect(conditions[0].Type).To(Equal(string(utils.CTconditionTypes.Validated)))
+		Expect(conditions[0].Status).To(Equal(metav1.ConditionFalse))
+		Expect(conditions[0].Reason).To(Equal(string(utils.CTconditionReasons.Failed)))
+		Expect(conditions[0].Message).To(ContainSubstring(fmt.Sprintf(
+			"the value of key %s from ConfigMap %s is not a valid duration string", utils.HardwareProvisioningTimeoutConfigKey, hwTemplateCm)))
+		Expect(conditions[0].Message).To(ContainSubstring(fmt.Sprintf(
+			"the value of key %s from ConfigMap %s is not a valid duration string", utils.ClusterConfigurationTimeoutConfigKey, ptDefaultsCm)))
+		Expect(conditions[0].Message).To(ContainSubstring(fmt.Sprintf(
+			"the value of key %s from ConfigMap %s is not a valid duration string", utils.ClusterProvisioningTimeoutConfigKey, ciDefaultsCm)))
 	})
 })
 
@@ -388,27 +420,32 @@ var _ = Describe("validateConfigmapReference", func() {
 				Namespace: namespace,
 			},
 			Data: map[string]string{
+				utils.ClusterProvisioningTimeoutConfigKey: "40m",
 				utils.ClusterInstanceTemplateDefaultsConfigmapKey: `
 key: value`,
 			},
 		}
 		Expect(c.Create(ctx, cm)).To(Succeed())
 		err := validateConfigmapReference[map[string]any](
-			ctx, c, configmapName, namespace, utils.ClusterInstanceTemplateDefaultsConfigmapKey)
+			ctx, c, configmapName, namespace,
+			utils.ClusterInstanceTemplateDefaultsConfigmapKey,
+			utils.ClusterProvisioningTimeoutConfigKey)
 		Expect(err).ToNot(HaveOccurred())
 	})
 
 	It("should return validation error message for a missing configmap", func() {
 		// No ConfigMap created
 		err := validateConfigmapReference[map[string]any](
-			ctx, c, configmapName, namespace, utils.ClusterInstanceTemplateDefaultsConfigmapKey)
+			ctx, c, configmapName, namespace,
+			utils.ClusterInstanceTemplateDefaultsConfigmapKey,
+			utils.ClusterProvisioningTimeoutConfigKey)
 		Expect(err).To(HaveOccurred())
 		Expect(utils.IsInputError(err)).To(BeTrue())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(
-			"failed to get ConfigmapReference: the ConfigMap %s is not found in the namespace %s", configmapName, namespace)))
+			"failed to get ConfigmapReference: the ConfigMap '%s' is not found in the namespace '%s'", configmapName, namespace)))
 	})
 
-	It("should return validation error message for missing expected key in configmap", func() {
+	It("should return validation error message for missing template data key in configmap", func() {
 		// Create a ConfigMap without the expected key
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
@@ -422,15 +459,17 @@ key: value`,
 		Expect(c.Create(ctx, cm)).To(Succeed())
 
 		err := validateConfigmapReference[map[string]any](
-			ctx, c, configmapName, namespace, utils.ClusterInstanceTemplateDefaultsConfigmapKey)
+			ctx, c, configmapName, namespace,
+			utils.ClusterInstanceTemplateDefaultsConfigmapKey,
+			utils.ClusterProvisioningTimeoutConfigKey)
 		Expect(err).To(HaveOccurred())
 		Expect(utils.IsInputError(err)).To(BeTrue())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(
-			"the expected key %s does not exist in the ConfigMap %s data", utils.ClusterInstanceTemplateDefaultsConfigmapKey, configmapName)))
+			"the ConfigMap '%s' does not contain a field named '%s'", configmapName, utils.ClusterInstanceTemplateDefaultsConfigmapKey)))
 	})
 
-	It("should return validation error message for invalid YAML in configmap data", func() {
-		// Create a ConfigMap with invalid YAML
+	It("should return validation error message for invalid YAML in configmap template data", func() {
+		// Create a ConfigMap with invalid data YAML
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      configmapName,
@@ -443,10 +482,36 @@ key: value`,
 		Expect(c.Create(ctx, cm)).To(Succeed())
 
 		err := validateConfigmapReference[map[string]any](
-			ctx, c, configmapName, namespace, utils.ClusterInstanceTemplateDefaultsConfigmapKey)
+			ctx, c, configmapName, namespace,
+			utils.ClusterInstanceTemplateDefaultsConfigmapKey,
+			utils.ClusterProvisioningTimeoutConfigKey)
 		Expect(err).To(HaveOccurred())
 		Expect(utils.IsInputError(err)).To(BeTrue())
 		Expect(err.Error()).To(ContainSubstring("the value of key"))
+	})
+
+	It("should return validation error message for invalid timeout value in configmap", func() {
+		// Create a ConfigMap with non-integer string
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      configmapName,
+				Namespace: namespace,
+			},
+			Data: map[string]string{
+				utils.ClusterProvisioningTimeoutConfigKey: "invalid-timeout",
+				utils.ClusterInstanceTemplateDefaultsConfigmapKey: `
+key: value`,
+			},
+		}
+		Expect(c.Create(ctx, cm)).To(Succeed())
+
+		err := validateConfigmapReference[map[string]any](
+			ctx, c, configmapName, namespace,
+			utils.ClusterInstanceTemplateDefaultsConfigmapKey,
+			utils.ClusterProvisioningTimeoutConfigKey)
+		Expect(err).To(HaveOccurred())
+		Expect(utils.IsInputError(err)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("is not a valid duration string"))
 	})
 
 	It("should return validation error message if configmap is mutable", func() {
@@ -466,7 +531,9 @@ key: value`,
 		Expect(c.Create(ctx, cm)).To(Succeed())
 
 		err := validateConfigmapReference[map[string]any](
-			ctx, c, configmapName, namespace, utils.ClusterInstanceTemplateDefaultsConfigmapKey)
+			ctx, c, configmapName, namespace,
+			utils.ClusterInstanceTemplateDefaultsConfigmapKey,
+			utils.ClusterProvisioningTimeoutConfigKey)
 		Expect(err).To(HaveOccurred())
 		Expect(utils.IsInputError(err)).To(BeTrue())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(
@@ -488,7 +555,9 @@ key: value`,
 		Expect(c.Create(ctx, cm)).To(Succeed())
 
 		err := validateConfigmapReference[map[string]any](
-			ctx, c, configmapName, namespace, utils.ClusterInstanceTemplateDefaultsConfigmapKey)
+			ctx, c, configmapName, namespace,
+			utils.ClusterInstanceTemplateDefaultsConfigmapKey,
+			utils.ClusterProvisioningTimeoutConfigKey)
 		Expect(err).ToNot(HaveOccurred())
 
 		// Verify that the configmap is patched to be immutable
@@ -698,3 +767,145 @@ var _ = Describe("Validate Cluster Instance TemplateID", func() {
 		Expect(err).ToNot(HaveOccurred())
 	})
 })
+
+var (
+	tName    = "cluster-template-a"
+	tVersion = "v1.0.0"
+)
+
+func Test_validateTemplateParameterSchema(t *testing.T) {
+	type args struct {
+		object *provisioningv1alpha1.ClusterTemplate
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+		errText string
+	}{
+		{
+			name: "ok",
+			args: args{
+				object: &provisioningv1alpha1.ClusterTemplate{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: getClusterTemplateRefName(tName, tVersion),
+					},
+					Spec: provisioningv1alpha1.ClusterTemplateSpec{
+						TemplateParameterSchema: runtime.RawExtension{Raw: []byte(`{
+		"properties": {
+			"nodeClusterName": {"type": "string"},
+			"oCloudSiteId": {"type": "string"},
+			"clusterInstanceParameters": {"type": "object"},
+			"policyTemplateParameters": {"type": "object"}
+		},
+		"type": "object",
+		"required": [
+	"nodeClusterName",
+	"oCloudSiteId",
+	"policyTemplateParameters",
+	"clusterInstanceParameters"
+	]
+	}`)},
+					},
+				},
+			},
+			wantErr: false,
+			errText: "",
+		},
+		{
+			name: "bad type",
+			args: args{
+				object: &provisioningv1alpha1.ClusterTemplate{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: getClusterTemplateRefName(tName, tVersion),
+					},
+					Spec: provisioningv1alpha1.ClusterTemplateSpec{
+						TemplateParameterSchema: runtime.RawExtension{Raw: []byte(`{
+		"properties": {
+			"nodeClusterName": {"type": "string"},
+			"oCloudSiteId": {"type": "string"},
+			"clusterInstanceParameters": {"type": "string"},
+			"policyTemplateParameters": {"type": "object"}
+		},
+		"type": "object",
+		"required": [
+	"nodeClusterName",
+	"oCloudSiteId",
+	"policyTemplateParameters",
+	"clusterInstanceParameters"
+	]
+	}`)},
+					},
+				},
+			},
+			wantErr: true,
+			errText: "failed to validate ClusterTemplate: cluster-template-a.v1.0.0. The following entries are present but have a unexpected type: clusterInstanceParameters (expected = object actual= string).",
+		},
+		{
+			name: "missing parameter and bad type",
+			args: args{
+				object: &provisioningv1alpha1.ClusterTemplate{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: getClusterTemplateRefName(tName, tVersion),
+					},
+					Spec: provisioningv1alpha1.ClusterTemplateSpec{
+						TemplateParameterSchema: runtime.RawExtension{Raw: []byte(`{
+		"properties": {
+			"oCloudSiteId": {"type": "string"},
+			"clusterInstanceParameters": {"type": "string"},
+			"policyTemplateParameters": {"type": "object"}
+		},
+		"type": "object",
+		"required": [
+	"nodeClusterName",
+	"oCloudSiteId",
+	"policyTemplateParameters",
+	"clusterInstanceParameters"
+	]
+	}`)},
+					},
+				},
+			},
+			wantErr: true,
+			errText: "failed to validate ClusterTemplate: cluster-template-a.v1.0.0. The following mandatory fields are missing: nodeClusterName. The following entries are present but have a unexpected type: clusterInstanceParameters (expected = object actual= string).",
+		},
+		{
+			name: "missing parameter and bad type, and missing required entry",
+			args: args{
+				object: &provisioningv1alpha1.ClusterTemplate{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: getClusterTemplateRefName(tName, tVersion),
+					},
+					Spec: provisioningv1alpha1.ClusterTemplateSpec{
+						TemplateParameterSchema: runtime.RawExtension{Raw: []byte(`{
+		"properties": {
+			"oCloudSiteId": {"type": "string"},
+			"clusterInstanceParameters": {"type": "string"},
+			"policyTemplateParameters": {"type": "object"}
+		},
+		"type": "object",
+		"required": [
+	"nodeClusterName",
+	"policyTemplateParameters",
+	"clusterInstanceParameters"
+	]
+	}`)},
+					},
+				},
+			},
+			wantErr: true,
+			errText: "failed to validate ClusterTemplate: cluster-template-a.v1.0.0. The following mandatory fields are missing: nodeClusterName. The following entries are present but have a unexpected type: clusterInstanceParameters (expected = object actual= string).",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var err error
+			if err = validateTemplateParameterSchema(tt.args.object); (err != nil) != tt.wantErr {
+				t.Errorf("validateTemplateParameterSchema() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && err.Error() != tt.errText {
+				t.Errorf("validateTemplateParameterSchema() errorText = %s, wantErrorText %s", err.Error(), tt.errText)
+			}
+		})
+	}
+}

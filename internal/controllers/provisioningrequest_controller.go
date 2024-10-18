@@ -64,6 +64,7 @@ type provisioningRequestReconcilerTask struct {
 	object       *provisioningv1alpha1.ProvisioningRequest
 	clusterInput *clusterInput
 	ctNamespace  string
+	timeouts     *timeouts
 }
 
 // clusterInput holds the merged input data for a cluster
@@ -72,11 +73,13 @@ type clusterInput struct {
 	policyTemplateData  map[string]any
 }
 
-type nodeInfo struct {
-	bmcAddress     string
-	bmcCredentials string
-	nodeName       string
-	interfaces     []*hwv1alpha1.Interface
+// timeouts holds the timeout values, in minutes,
+// for hardware provisioning, cluster provisioning
+// and cluster configuration.
+type timeouts struct {
+	hardwareProvisioning time.Duration
+	clusterProvisioning  time.Duration
+	clusterConfiguration time.Duration
 }
 
 type deleteOrUpdateEvent interface {
@@ -84,11 +87,9 @@ type deleteOrUpdateEvent interface {
 }
 
 const (
-	provisioningRequestFinalizer    = "provisioningrequest.o2ims.provisioning.oran.org/finalizer"
-	provisioningRequestNameLabel    = "provisioningrequest.o2ims.provisioning.oran.org/name"
-	ztpDoneLabel                    = "ztp-done"
-	clusterInstanceParametersString = "clusterInstanceParameters"
-	policyTemplateParametersString  = "policyTemplateParameters"
+	provisioningRequestFinalizer = "provisioningrequest.o2ims.provisioning.oran.org/finalizer"
+	provisioningRequestNameLabel = "provisioningrequest.o2ims.provisioning.oran.org/name"
+	ztpDoneLabel                 = "ztp-done"
 )
 
 func getClusterTemplateRefName(name, version string) string {
@@ -165,6 +166,7 @@ func (r *ProvisioningRequestReconciler) Reconcile(
 		object:       object,
 		clusterInput: &clusterInput{},
 		ctNamespace:  "",
+		timeouts:     &timeouts{},
 	}
 	result, err = task.run(ctx)
 	return
@@ -284,7 +286,14 @@ func (t *provisioningRequestReconcilerTask) run(ctx context.Context) (ctrl.Resul
 // the cluster by evaluating the statuses of related resources like NodePool, ClusterInstance
 // and policy configuration when applicable, and update the corresponding ProvisioningRequest
 // status conditions
-func (t *provisioningRequestReconcilerTask) checkClusterDeployConfigState(ctx context.Context) (ctrl.Result, error) {
+func (t *provisioningRequestReconcilerTask) checkClusterDeployConfigState(ctx context.Context) (result ctrl.Result, err error) {
+	defer func() {
+		// Check resources validation and preparation failures at the end
+		if updateErr := t.checkResourcePreparationStatus(ctx); updateErr != nil {
+			err = updateErr
+		}
+	}()
+
 	// Check the NodePool status if exists
 	if t.object.Status.NodePoolRef == nil {
 		return doNotRequeue(), nil
@@ -337,6 +346,36 @@ func (t *provisioningRequestReconcilerTask) checkClusterDeployConfigState(ctx co
 	return doNotRequeue(), nil
 }
 
+// checkResourcePreparationStatus checks for validation and preparation failures, setting the
+// provisioningState to failed if no provisioning is currently in progress and issues are found.
+func (t *provisioningRequestReconcilerTask) checkResourcePreparationStatus(ctx context.Context) error {
+	if t.object.Status.ProvisioningStatus.ProvisioningState == provisioningv1alpha1.StateProgressing {
+		// On-going provisioning is in progress, skip checking resource validation/preparation
+		return nil
+	}
+
+	conditionTypes := []utils.ConditionType{
+		utils.PRconditionTypes.Validated,
+		utils.PRconditionTypes.ClusterInstanceRendered,
+		utils.PRconditionTypes.ClusterResourcesCreated,
+		utils.PRconditionTypes.HardwareTemplateRendered,
+	}
+
+	for _, condType := range conditionTypes {
+		cond := meta.FindStatusCondition(t.object.Status.Conditions, string(condType))
+		if cond != nil && cond.Status == metav1.ConditionFalse {
+			// Set the provisioning state to failed if any condition is false
+			utils.SetProvisioningStateFailed(t.object, cond.Message)
+			break
+		}
+	}
+
+	if err := utils.UpdateK8sCRStatus(ctx, t.client, t.object); err != nil {
+		return fmt.Errorf("failed to update status for ProvisioningRequest %s: %w", t.object.Name, err)
+	}
+	return nil
+}
+
 func (t *provisioningRequestReconcilerTask) handleValidation(ctx context.Context) error {
 	// Validate provisioning request CR
 	err := t.validateProvisioningRequestCR(ctx)
@@ -374,6 +413,66 @@ func (t *provisioningRequestReconcilerTask) handleValidation(ctx context.Context
 	return err
 }
 
+// validateAndLoadTimeouts validates and loads timeout values from configmaps for
+// hardware provisioning, cluster provisioning, and configuration into timeouts variable.
+// If a timeout is not defined in the configmap, the default timeout value is used.
+func (t *provisioningRequestReconcilerTask) validateAndLoadTimeouts(
+	ctx context.Context, clusterTemplate *provisioningv1alpha1.ClusterTemplate) error {
+	// Initialize with default timeouts
+	t.timeouts.clusterProvisioning = utils.DefaultClusterProvisioningTimeout
+	t.timeouts.hardwareProvisioning = utils.DefaultHardwareProvisioningTimeout
+	t.timeouts.clusterConfiguration = utils.DefaultClusterConfigurationTimeout
+
+	// Load hardware provisioning timeout if exists.
+	hwCmName := clusterTemplate.Spec.Templates.HwTemplate
+	hwCm, err := utils.GetConfigmap(
+		ctx, t.client, hwCmName, utils.InventoryNamespace)
+	if err != nil {
+		return fmt.Errorf("failed to get ConfigMap %s: %w", hwCmName, err)
+	}
+	hwTimeout, err := utils.ExtractTimeoutFromConfigMap(
+		hwCm, utils.HardwareProvisioningTimeoutConfigKey)
+	if err != nil {
+		return fmt.Errorf("failed to get timeout config for hardware provisioning: %w", err)
+	}
+	if hwTimeout != 0 {
+		t.timeouts.hardwareProvisioning = hwTimeout
+	}
+
+	// Load cluster provisioning timeout if exists.
+	ciCmName := clusterTemplate.Spec.Templates.ClusterInstanceDefaults
+	ciCm, err := utils.GetConfigmap(
+		ctx, t.client, ciCmName, clusterTemplate.Namespace)
+	if err != nil {
+		return fmt.Errorf("failed to get ConfigMap %s: %w", ciCmName, err)
+	}
+	ciTimeout, err := utils.ExtractTimeoutFromConfigMap(
+		ciCm, utils.ClusterProvisioningTimeoutConfigKey)
+	if err != nil {
+		return fmt.Errorf("failed to get timeout config for cluster provisioning: %w", err)
+	}
+	if ciTimeout != 0 {
+		t.timeouts.clusterProvisioning = ciTimeout
+	}
+
+	// Load configuration timeout if exists.
+	ptCmName := clusterTemplate.Spec.Templates.PolicyTemplateDefaults
+	ptCm, err := utils.GetConfigmap(
+		ctx, t.client, ptCmName, clusterTemplate.Namespace)
+	if err != nil {
+		return fmt.Errorf("failed to get ConfigMap %s: %w", ptCmName, err)
+	}
+	ptTimeout, err := utils.ExtractTimeoutFromConfigMap(
+		ptCm, utils.ClusterConfigurationTimeoutConfigKey)
+	if err != nil {
+		return fmt.Errorf("failed to get timeout config for cluster configuration: %w", err)
+	}
+	if ptTimeout != 0 {
+		t.timeouts.clusterConfiguration = ptTimeout
+	}
+	return nil
+}
+
 // validateProvisioningRequestCR validates the ProvisioningRequest CR
 func (t *provisioningRequestReconcilerTask) validateProvisioningRequestCR(ctx context.Context) error {
 	// Check the referenced cluster template is present and valid
@@ -386,81 +485,193 @@ func (t *provisioningRequestReconcilerTask) validateProvisioningRequestCR(ctx co
 		return utils.NewInputError("the clustertemplate validation has failed")
 	}
 
-	// Validate the clusterinstance input from ProvisioningRequest against the schema
-	clusterTemplateInputMap, err := t.getClusterTemplateInputFromProvisioningRequest(
-		&t.object.Spec.ClusterTemplateInput.ClusterInstanceInput)
-	if err != nil {
-		return utils.NewInputError("failed to get the ClusterTemplate input for ClusterInstance: %s", err.Error())
+	if err = t.validateAndLoadTimeouts(ctx, clusterTemplate); err != nil {
+		return fmt.Errorf("failed to load timeouts: %w", err)
 	}
-	var subSchema []byte
-	subSchema, err = utils.ExtractSubSchema(clusterTemplate.Spec.TemplateParameterSchema.Raw, clusterInstanceParametersString)
-	if err != nil {
-		return utils.NewInputError("failed to extract clusterInstanceParameters subSchema: %s", err.Error())
+
+	if err = t.validateTemplateInputMatchesSchema(clusterTemplate); err != nil {
+		return utils.NewInputError(err.Error())
 	}
-	err = t.validateClusterTemplateInputMatchesSchema(
-		&runtime.RawExtension{Raw: subSchema},
-		clusterTemplateInputMap,
-		utils.ClusterInstanceDataType)
-	if err != nil {
-		return utils.NewInputError("failed to validate ClusterTemplate input matches schema: %s", err.Error())
+
+	if err = t.validateClusterInstanceInputMatchesSchema(ctx, clusterTemplate); err != nil {
+		return fmt.Errorf("failed to validate ClusterInstance input: %w", err)
 	}
-	// Get the merged clusterinstance input data
-	mergedClusterInstanceData, err := t.getMergedClusterInputData(ctx, clusterTemplate, utils.ClusterInstanceDataType)
+
+	if err = t.validatePolicyTemplateInputMatchesSchema(ctx, clusterTemplate); err != nil {
+		return fmt.Errorf("failed to validate PolicyTemplate input: %w", err)
+	}
+
+	// TODO: Verify that ClusterInstance is per ClusterRequest basis.
+	//       There should not be multiple ClusterRequests for the same ClusterInstance.
+	return nil
+}
+
+// validateClusterInstanceInputMatchesSchema validates that the ClusterInstance input
+// from the ProvisioningRequest matches the schema defined in the ClusterTemplate.
+// If valid, the merged ClusterInstance data is stored in the clusterInput.
+func (t *provisioningRequestReconcilerTask) validateClusterInstanceInputMatchesSchema(
+	ctx context.Context, clusterTemplate *provisioningv1alpha1.ClusterTemplate) error {
+
+	// Get the subschema for ClusterInstanceParameters
+	clusterInstanceSubSchema, err := utils.ExtractSubSchema(
+		clusterTemplate.Spec.TemplateParameterSchema.Raw, utils.TemplateParamClusterInstance)
+	if err != nil {
+		return utils.NewInputError(
+			"failed to extract %s subschema: %s", utils.TemplateParamClusterInstance, err.Error())
+	}
+	// Any unknown fields not defined in the schema will be disallowed
+	utils.DisallowUnknownFieldsInSchema(clusterInstanceSubSchema)
+
+	// Get the matching input for ClusterInstanceParameters
+	clusterInstanceMatchingInput, err := utils.ExtractMatchingInput(
+		t.object.Spec.TemplateParameters.Raw, utils.TemplateParamClusterInstance)
+	if err != nil {
+		return utils.NewInputError(
+			"failed to extract matching input for subSchema %s: %w", utils.TemplateParamClusterInstance, err)
+	}
+	clusterInstanceMatchingInputMap := clusterInstanceMatchingInput.(map[string]any)
+
+	// The schema defined in ClusterTemplate's spec.templateParameterSchema for
+	// clusterInstanceParameters represents a subschema of ClusterInstance parameters that
+	// are allowed/exposed only to the ProvisioningRequest. Therefore, validate the ClusterInstance
+	// input from the ProvisioningRequest against this schema, rather than validating the merged
+	// ClusterInstance data. A full validation of the complete ClusterInstance input will be
+	// performed during the ClusterInstance dry-run later.
+	err = utils.ValidateJsonAgainstJsonSchema(
+		clusterInstanceSubSchema, clusterInstanceMatchingInput)
+	if err != nil {
+		return utils.NewInputError(
+			"the provided %s does not match the schema from ClusterTemplate (%s): %w",
+			utils.TemplateParamClusterInstance, clusterTemplate.Name, err)
+	}
+
+	// Get the merged ClusterInstance input data
+	mergedClusterInstanceData, err := t.getMergedClusterInputData(
+		ctx, clusterTemplate.Spec.Templates.ClusterInstanceDefaults,
+		clusterInstanceMatchingInputMap,
+		utils.TemplateParamClusterInstance)
 	if err != nil {
 		return fmt.Errorf("failed to get merged cluster input data: %w", err)
 	}
 
-	// Validate the merged policytemplate input data matches the schema
-	mergedPolicyTemplateData, err := t.getMergedClusterInputData(ctx, clusterTemplate, utils.PolicyTemplateDataType)
-	if err != nil {
-		return fmt.Errorf("failed to get merged cluster input data: %w", err)
-	}
-	subSchema, err = utils.ExtractSubSchema(clusterTemplate.Spec.TemplateParameterSchema.Raw, policyTemplateParametersString)
-	if err != nil {
-		return utils.NewInputError("failed to extract policyTemplateParameters subSchema: %s", err.Error())
-	}
-	err = t.validateClusterTemplateInputMatchesSchema(
-		&runtime.RawExtension{Raw: subSchema},
-		mergedPolicyTemplateData,
-		utils.PolicyTemplateDataType)
-	if err != nil {
-		return utils.NewInputError("failed to validate ClusterTemplate input matches schema: %s", err.Error())
-	}
-
-	// TODO: Verify that ClusterInstance is per ProvisioningRequest basis.
-	//       There should not be multiple ProvisioningRequests for the same ClusterInstance.
-
-	// The ProvisioningRequest is valid
-	// Set the clusterInput with the merged clusterinstance and policy template data
 	t.clusterInput.clusterInstanceData = mergedClusterInstanceData
+	return nil
+}
+
+// validatePolicyTemplateInputMatchesSchema validates that the merged PolicyTemplate input
+// (from both the ProvisioningRequest and the default configmap) matches the schema defined
+// in the ClusterTemplate. If valid, the merged PolicyTemplate data is stored in clusterInput.
+func (t *provisioningRequestReconcilerTask) validatePolicyTemplateInputMatchesSchema(
+	ctx context.Context, clusterTemplate *provisioningv1alpha1.ClusterTemplate) error {
+
+	// Get the subschema for PolicyTemplateParameters
+	policyTemplateSubSchema, err := utils.ExtractSubSchema(
+		clusterTemplate.Spec.TemplateParameterSchema.Raw, utils.TemplateParamPolicyConfig)
+	if err != nil {
+		return utils.NewInputError(
+			"failed to extract %s subschema: %s", utils.TemplateParamPolicyConfig, err.Error())
+	}
+	// Get the matching input for PolicyTemplateParameters
+	policyTemplateMatchingInput, err := utils.ExtractMatchingInput(
+		t.object.Spec.TemplateParameters.Raw, utils.TemplateParamPolicyConfig)
+	if err != nil {
+		return utils.NewInputError(
+			"failed to extract matching input for subschema %s: %w", utils.TemplateParamPolicyConfig, err)
+	}
+	policyTemplateMatchingInputMap := policyTemplateMatchingInput.(map[string]any)
+
+	// Get the merged PolicyTemplate input data
+	mergedPolicyTemplateData, err := t.getMergedClusterInputData(
+		ctx, clusterTemplate.Spec.Templates.PolicyTemplateDefaults,
+		policyTemplateMatchingInputMap,
+		utils.TemplateParamPolicyConfig)
+	if err != nil {
+		return fmt.Errorf("failed to get merged cluster input data: %w", err)
+	}
+
+	// Validate the merged PolicyTemplate input data matches the schema
+	err = utils.ValidateJsonAgainstJsonSchema(
+		policyTemplateSubSchema, mergedPolicyTemplateData)
+	if err != nil {
+		return utils.NewInputError(
+			"the provided %s does not match the schema from ClusterTemplate (%s): %w",
+			utils.TemplateParamPolicyConfig, clusterTemplate.Name, err)
+	}
+
 	t.clusterInput.policyTemplateData = mergedPolicyTemplateData
 	return nil
 }
 
-func (t *provisioningRequestReconcilerTask) getMergedClusterInputData(
-	ctx context.Context, clusterTemplate *provisioningv1alpha1.ClusterTemplate, dataType string) (map[string]any, error) {
-
-	var clusterTemplateInput runtime.RawExtension
-	var templateDefaultsCm string
-	var templateDefaultsCmKey string
-
-	switch dataType {
-	case utils.ClusterInstanceDataType:
-		clusterTemplateInput = t.object.Spec.ClusterTemplateInput.ClusterInstanceInput
-		templateDefaultsCm = clusterTemplate.Spec.Templates.ClusterInstanceDefaults
-		templateDefaultsCmKey = utils.ClusterInstanceTemplateDefaultsConfigmapKey
-	case utils.PolicyTemplateDataType:
-		clusterTemplateInput = t.object.Spec.ClusterTemplateInput.PolicyTemplateInput
-		templateDefaultsCm = clusterTemplate.Spec.Templates.PolicyTemplateDefaults
-		templateDefaultsCmKey = utils.PolicyTemplateDefaultsConfigmapKey
-	default:
-		return nil, utils.NewInputError("unsupported data type")
+// validateTemplateInputMatchesSchema validates the input parameters from the ProvisioningRequest
+// against the schema defined in the ClusterTemplate. This function focuses on validating the
+// input other than clusterInstanceParameters and policyTemplateParameters, as those will be
+// validated separately. It ensures the input parameters have the expected types and any
+// required parameters are present.
+func (t *provisioningRequestReconcilerTask) validateTemplateInputMatchesSchema(
+	clusterTemplate *provisioningv1alpha1.ClusterTemplate) error {
+	// Unmarshal the full schema from the ClusterTemplate
+	templateParamSchema := make(map[string]any)
+	err := json.Unmarshal(clusterTemplate.Spec.TemplateParameterSchema.Raw, &templateParamSchema)
+	if err != nil {
+		// Unlikely to happen since it has been validated by API server
+		return utils.NewInputError("error unmarshaling template schema: %w", err)
 	}
 
-	// Get the clustertemplate input from provisioning request.
-	clusterTemplateInputMap, err := t.getClusterTemplateInputFromProvisioningRequest(&clusterTemplateInput)
+	// Unmarshal the template input from the ProvisioningRequest
+	templateParamsInput := make(map[string]any)
+	if err = json.Unmarshal(t.object.Spec.TemplateParameters.Raw, &templateParamsInput); err != nil {
+		// Unlikely to happen since it has been validated by API server
+		return utils.NewInputError("error unmarshaling templateParameters: %w", err)
+	}
+
+	// The following errors of missing keys are unlikely since the schema should already
+	// be validated by ClusterTemplate controller
+	schemaProperties, ok := templateParamSchema["properties"]
+	if !ok {
+		return utils.NewInputError(
+			"missing keyword 'properties' in the schema from ClusterTemplate (%s)", clusterTemplate.Name)
+	}
+	clusterInstanceSubSchema, ok := schemaProperties.(map[string]any)[utils.TemplateParamClusterInstance]
+	if !ok {
+		return utils.NewInputError(
+			"missing required property '%s' in the schema from ClusterTemplate (%s)",
+			utils.TemplateParamClusterInstance, clusterTemplate.Name)
+	}
+	policyTemplateSubSchema, ok := schemaProperties.(map[string]any)[utils.TemplateParamPolicyConfig]
+	if !ok {
+		return utils.NewInputError(
+			"missing required property '%s' in the schema from ClusterTemplate (%s)",
+			utils.TemplateParamPolicyConfig, clusterTemplate.Name)
+	}
+
+	// The ClusterInstance and PolicyTemplate parameters have their own specific validation rules
+	// and will be handled separately. For now, remove the subschemas for those parameters to
+	// ensure they are not validated at this stage.
+	delete(clusterInstanceSubSchema.(map[string]any), "properties")
+	delete(policyTemplateSubSchema.(map[string]any), "properties")
+
+	err = utils.ValidateJsonAgainstJsonSchema(templateParamSchema, templateParamsInput)
 	if err != nil {
-		return nil, utils.NewInputError("failed to get the ClusterTemplate input for %s: %s", dataType, err.Error())
+		return utils.NewInputError(
+			"the provided templateParameters does not match the schema from ClusterTemplate (%s): %w",
+			clusterTemplate.Name, err)
+	}
+
+	return nil
+}
+
+func (t *provisioningRequestReconcilerTask) getMergedClusterInputData(
+	ctx context.Context, templateDefaultsCm string, clusterTemplateInput map[string]any, templateParam string) (map[string]any, error) {
+
+	var templateDefaultsCmKey string
+
+	switch templateParam {
+	case utils.TemplateParamClusterInstance:
+		templateDefaultsCmKey = utils.ClusterInstanceTemplateDefaultsConfigmapKey
+	case utils.TemplateParamPolicyConfig:
+		templateDefaultsCmKey = utils.PolicyTemplateDefaultsConfigmapKey
+	default:
+		return nil, utils.NewInputError("unsupported template parameter")
 	}
 
 	// Retrieve the configmap that holds the default data.
@@ -469,29 +680,29 @@ func (t *provisioningRequestReconcilerTask) getMergedClusterInputData(
 		return nil, fmt.Errorf("failed to get ConfigMap %s: %w", templateDefaultsCm, err)
 	}
 	clusterTemplateDefaultsMap, err := utils.ExtractTemplateDataFromConfigMap[map[string]any](
-		ctx, t.client, templateCm, templateDefaultsCmKey)
+		templateCm, templateDefaultsCmKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get template defaults from ConfigMap %s: %w", templateDefaultsCm, err)
 	}
 
-	if dataType == utils.ClusterInstanceDataType {
+	if templateParam == utils.TemplateParamClusterInstance {
 		// Special handling for overrides of ClusterInstance's extraLabels and extraAnnotations.
-		// The clusterTemplateInputMap will be overridden with the values from defaut configmap
+		// The clusterTemplateInput will be overridden with the values from defaut configmap
 		// if same labels/annotations exist in both.
 		if err := utils.OverrideClusterInstanceLabelsOrAnnotations(
-			clusterTemplateInputMap, clusterTemplateDefaultsMap); err != nil {
+			clusterTemplateInput, clusterTemplateDefaultsMap); err != nil {
 			return nil, utils.NewInputError(err.Error())
 		}
 	}
 
 	// Get the merged cluster data
-	mergedClusterDataMap, err := mergeClusterTemplateInputWithDefaults(clusterTemplateInputMap, clusterTemplateDefaultsMap)
+	mergedClusterDataMap, err := mergeClusterTemplateInputWithDefaults(clusterTemplateInput, clusterTemplateDefaultsMap)
 	if err != nil {
-		return nil, utils.NewInputError("failed to merge data for %s: %s", dataType, err.Error())
+		return nil, utils.NewInputError("failed to merge data for %s: %s", templateParam, err.Error())
 	}
 
 	t.logger.Info(
-		fmt.Sprintf("Merged the %s default data with the clusterTemplateInput data for ProvisioningRequest", dataType),
+		fmt.Sprintf("Merged the %s default data with the clusterTemplateInput data for ProvisioningRequest", templateParam),
 		slog.String("name", t.object.Name),
 	)
 	return mergedClusterDataMap, nil
@@ -724,7 +935,7 @@ func (t *provisioningRequestReconcilerTask) handleRenderHardwareTemplate(ctx con
 	}
 
 	nodeGroup, err := utils.ExtractTemplateDataFromConfigMap[[]hwv1alpha1.NodeGroup](
-		ctx, t.client, hwTemplateCm, utils.HwTemplateNodePool)
+		hwTemplateCm, utils.HwTemplateNodePool)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"failed to get the Hardware template from ConfigMap %s, err: %w", hwTemplateCmName, err)
@@ -742,9 +953,15 @@ func (t *provisioningRequestReconcilerTask) handleRenderHardwareTemplate(ctx con
 			nodeGroup[i].Size = count
 		}
 	}
+
+	siteId, err := utils.ExtractMatchingInput(
+		t.object.Spec.TemplateParameters.Raw, utils.TemplateParamOCloudSiteId)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get %s from templateParameters: %w", utils.TemplateParamOCloudSiteId, err)
+	}
+
 	nodePool.Spec.CloudID = clusterInstance.GetName()
-	nodePool.Spec.LocationSpec = t.object.Spec.LocationSpec
-	nodePool.Spec.Site = t.object.Spec.Site
+	nodePool.Spec.Site = siteId.(string)
 	nodePool.Spec.HwMgrId = hwTemplateCm.Data[utils.HwTemplatePluginMgr]
 	nodePool.Spec.NodeGroup = nodeGroup
 	nodePool.ObjectMeta.Name = clusterInstance.GetName()
@@ -760,16 +977,6 @@ func (t *provisioningRequestReconcilerTask) handleRenderHardwareTemplate(ctx con
 	labels[provisioningRequestNameLabel] = t.object.Name
 	nodePool.SetLabels(labels)
 	return nodePool, nil
-}
-
-func (t *provisioningRequestReconcilerTask) getClusterTemplateInputFromProvisioningRequest(clusterTemplateInput *runtime.RawExtension) (map[string]any, error) {
-	clusterTemplateInputMap := make(map[string]any)
-	err := json.Unmarshal(clusterTemplateInput.Raw, &clusterTemplateInputMap)
-	if err != nil {
-		// Unlikely to happen since it has been validated by API server
-		return nil, fmt.Errorf("error unmarshaling the cluster template input from ProvisioningRequest: %w", err)
-	}
-	return clusterTemplateInputMap, nil
 }
 
 // mergeClusterTemplateInputWithDefaults merges the cluster template input with the default data
@@ -902,17 +1109,8 @@ func (t *provisioningRequestReconcilerTask) handleClusterInstallation(ctx contex
 	isDryRun := false
 	err := t.applyClusterInstance(ctx, clusterInstance, isDryRun)
 	if err != nil {
-		if !utils.IsInputError(err) {
-			return fmt.Errorf("failed to apply the rendered ClusterInstance (%s): %s", clusterInstance.Name, err.Error())
-		}
-		utils.SetStatusCondition(&t.object.Status.Conditions,
-			utils.PRconditionTypes.ClusterInstanceProcessed,
-			utils.CRconditionReasons.NotApplied,
-			metav1.ConditionFalse,
-			fmt.Sprintf(
-				"Failed to apply the rendered ClusterInstance (%s): %s",
-				clusterInstance.Name, err.Error()),
-		)
+		return fmt.Errorf("failed to apply the rendered ClusterInstance (%s): %s", clusterInstance.Name, err.Error())
+
 	} else {
 		// Set ClusterDetails
 		if t.object.Status.ClusterDetails == nil {
@@ -980,6 +1178,10 @@ func (t *provisioningRequestReconcilerTask) handleClusterPolicyConfiguration(ctx
 	if err != nil {
 		return false, err
 	}
+	err = t.finalizeProvisioningIfComplete(ctx, allPoliciesCompliant)
+	if err != nil {
+		return false, err
+	}
 
 	// If there are policies that are not Compliant, we need to requeue and see if they
 	// time out or complete.
@@ -1004,6 +1206,45 @@ func (t *provisioningRequestReconcilerTask) updateZTPStatus(ctx context.Context,
 
 	if err := utils.UpdateK8sCRStatus(ctx, t.client, t.object); err != nil {
 		return fmt.Errorf("failed to update the ZTP status for ProvisioningRequest %s: %w", t.object.Name, err)
+	}
+	return nil
+}
+
+// updateOCloudNodeClusterId stores the clusterID in the provisionedResources status if it exists.
+func (t *provisioningRequestReconcilerTask) updateOCloudNodeClusterId(ctx context.Context) error {
+	managedCluster := &clusterv1.ManagedCluster{}
+	managedClusterExists, err := utils.DoesK8SResourceExist(
+		ctx, t.client, t.object.Status.ClusterDetails.Name, "", managedCluster)
+	if err != nil {
+		return fmt.Errorf("failed to check if managed cluster exists: %w", err)
+	}
+
+	if managedClusterExists {
+		// If the clusterID label exists, set it in the provisionedResources.
+		clusterID, exists := managedCluster.GetLabels()["clusterID"]
+		if exists {
+			if t.object.Status.ProvisioningStatus.ProvisionedResources == nil {
+				t.object.Status.ProvisioningStatus.ProvisionedResources = &provisioningv1alpha1.ProvisionedResources{}
+			}
+			t.object.Status.ProvisioningStatus.ProvisionedResources.OCloudNodeClusterId = clusterID
+		}
+	}
+	return nil
+}
+
+// finalizeProvisioningIfComplete checks if the provisioning process is completed.
+// If so, it sets the provisioning state to "fulfilled" and updates the provisioned
+// resources in the status.
+func (t *provisioningRequestReconcilerTask) finalizeProvisioningIfComplete(ctx context.Context, allPoliciesCompliant bool) error {
+	if utils.IsClusterProvisionCompleted(t.object) && allPoliciesCompliant {
+		utils.SetProvisioningStateFulfilled(t.object)
+		if err := t.updateOCloudNodeClusterId(ctx); err != nil {
+			return err
+		}
+	}
+
+	if err := utils.UpdateK8sCRStatus(ctx, t.client, t.object); err != nil {
+		return fmt.Errorf("failed to update status for ProvisioningRequest %s: %w", t.object.Name, err)
 	}
 	return nil
 }
@@ -1033,7 +1274,9 @@ func (t *provisioningRequestReconcilerTask) hasPolicyConfigurationTimedOut(ctx c
 				t.object.Status.ClusterDetails.NonCompliantAt = metav1.Now()
 			} else {
 				// If NonCompliantAt has been previously set, check for timeout.
-				policyTimedOut = utils.TimeoutExceeded(t.object)
+				policyTimedOut = utils.TimeoutExceeded(
+					t.object.Status.ClusterDetails.NonCompliantAt.Time,
+					t.timeouts.clusterConfiguration)
 			}
 		case string(utils.CRconditionReasons.TimedOut):
 			policyTimedOut = true
@@ -1047,7 +1290,9 @@ func (t *provisioningRequestReconcilerTask) hasPolicyConfigurationTimedOut(ctx c
 			// has been previously set.
 			if !t.object.Status.ClusterDetails.NonCompliantAt.IsZero() {
 				// If NonCompliantAt has been previously set, check for timeout.
-				policyTimedOut = utils.TimeoutExceeded(t.object)
+				policyTimedOut = utils.TimeoutExceeded(
+					t.object.Status.ClusterDetails.NonCompliantAt.Time,
+					t.timeouts.clusterConfiguration)
 			}
 		default:
 			t.logger.InfoContext(ctx,
@@ -1126,6 +1371,11 @@ func (t *provisioningRequestReconcilerTask) updateConfigurationAppliedStatus(
 			metav1.ConditionFalse,
 			"The Cluster is not yet ready",
 		)
+		if utils.IsClusterProvisionCompleted(t.object) &&
+			nonCompliantPolicyInEnforce {
+			utils.SetProvisioningStateInProgress(t.object,
+				"Waiting for cluster to be ready for policy configuration")
+		}
 		return
 	}
 
@@ -1134,9 +1384,13 @@ func (t *provisioningRequestReconcilerTask) updateConfigurationAppliedStatus(
 
 		message := "The configuration is still being applied"
 		reason := utils.CRconditionReasons.InProgress
+		utils.SetProvisioningStateInProgress(t.object,
+			"Cluster configuration is being applied")
 		if policyTimedOut {
 			message += ", but it timed out"
 			reason = utils.CRconditionReasons.TimedOut
+			utils.SetProvisioningStateFailed(t.object,
+				"Cluster configuration timed out")
 		}
 		utils.SetStatusCondition(&t.object.Status.Conditions,
 			utils.PRconditionTypes.ConfigurationApplied,
@@ -1163,25 +1417,27 @@ func (t *provisioningRequestReconcilerTask) updateClusterInstanceProcessedStatus
 		return
 	}
 
-	clusterInstanceConditionTypes := []string{
-		"ClusterInstanceValidated",
-		"RenderedTemplates",
-		"RenderedTemplatesValidated",
-		"RenderedTemplatesApplied",
+	clusterInstanceConditionTypes := []siteconfig.ClusterInstanceConditionType{
+		siteconfig.ClusterInstanceValidated,
+		siteconfig.RenderedTemplates,
+		siteconfig.RenderedTemplatesValidated,
+		siteconfig.RenderedTemplatesApplied,
 	}
 
 	if len(ci.Status.Conditions) == 0 {
+		message := fmt.Sprintf("Waiting for ClusterInstance (%s) to be processed", ci.Name)
 		utils.SetStatusCondition(&t.object.Status.Conditions,
 			utils.PRconditionTypes.ClusterInstanceProcessed,
 			utils.CRconditionReasons.Unknown,
 			metav1.ConditionUnknown,
-			fmt.Sprintf("Waiting for ClusterInstance (%s) to be processed", ci.Name),
+			message,
 		)
+		utils.SetProvisioningStateInProgress(t.object, message)
 		return
 	}
 
 	for _, condType := range clusterInstanceConditionTypes {
-		ciCondition := meta.FindStatusCondition(ci.Status.Conditions, condType)
+		ciCondition := meta.FindStatusCondition(ci.Status.Conditions, string(condType))
 		if ciCondition != nil && ciCondition.Status != metav1.ConditionTrue {
 			utils.SetStatusCondition(&t.object.Status.Conditions,
 				utils.PRconditionTypes.ClusterInstanceProcessed,
@@ -1189,7 +1445,7 @@ func (t *provisioningRequestReconcilerTask) updateClusterInstanceProcessedStatus
 				ciCondition.Status,
 				ciCondition.Message,
 			)
-
+			utils.SetProvisioningStateFailed(t.object, ciCondition.Message)
 			return
 		}
 	}
@@ -1215,12 +1471,14 @@ func (t *provisioningRequestReconcilerTask) updateClusterProvisionStatus(ci *sit
 		crClusterInstanceProcessedCond := meta.FindStatusCondition(
 			t.object.Status.Conditions, string(utils.PRconditionTypes.ClusterInstanceProcessed))
 		if crClusterInstanceProcessedCond != nil && crClusterInstanceProcessedCond.Status == metav1.ConditionTrue {
+			message := "Waiting for cluster installation to start"
 			utils.SetStatusCondition(&t.object.Status.Conditions,
 				utils.PRconditionTypes.ClusterProvisioned,
 				utils.CRconditionReasons.Unknown,
 				metav1.ConditionUnknown,
-				"Waiting for cluster provisioning to start",
+				message,
 			)
+			utils.SetProvisioningStateInProgress(t.object, message)
 		}
 	} else {
 		utils.SetStatusCondition(&t.object.Status.Conditions,
@@ -1237,17 +1495,24 @@ func (t *provisioningRequestReconcilerTask) updateClusterProvisionStatus(ci *sit
 			t.object.Status.ClusterDetails.ClusterProvisionStartedAt = metav1.Now()
 		}
 
-		// If it's not failed or completed, check if it has timed out
-		if !utils.IsClusterProvisionCompletedOrFailed(t.object) {
-			if time.Since(t.object.Status.ClusterDetails.ClusterProvisionStartedAt.Time) >
-				time.Duration(t.object.Spec.Timeout.ClusterProvisioning)*time.Minute {
+		if utils.IsClusterProvisionFailed(t.object) {
+			utils.SetProvisioningStateFailed(t.object, "Cluster installation failed")
+		} else if !utils.IsClusterProvisionCompleted(t.object) {
+			// If it's not failed or completed, check if it has timed out
+			if utils.TimeoutExceeded(
+				t.object.Status.ClusterDetails.ClusterProvisionStartedAt.Time,
+				t.timeouts.clusterProvisioning) {
 				// timed out
+				message := "Cluster installation timed out"
 				utils.SetStatusCondition(&t.object.Status.Conditions,
 					utils.PRconditionTypes.ClusterProvisioned,
 					utils.CRconditionReasons.TimedOut,
 					metav1.ConditionFalse,
-					"Cluster provisioning timed out",
+					message,
 				)
+				utils.SetProvisioningStateFailed(t.object, message)
+			} else {
+				utils.SetProvisioningStateInProgress(t.object, "Cluster installation is in progress")
 			}
 		}
 	}
@@ -1401,14 +1666,16 @@ func (t *provisioningRequestReconcilerTask) createClusterInstanceBMCSecrets( // 
 	ctx context.Context, clusterName string) error {
 
 	// The BMC credential details are for now obtained from the ProvisioningRequest.
-	inputData, err := t.getClusterTemplateInputFromProvisioningRequest(&t.object.Spec.ClusterTemplateInput.ClusterInstanceInput)
+	clusterTemplateInputParams := make(map[string]any)
+	err := json.Unmarshal(t.object.Spec.TemplateParameters.Raw, &clusterTemplateInputParams)
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal ClusterInstanceInput raw data: %w", err)
+		// Unlikely to happen since it has been validated by API server
+		return fmt.Errorf("error unmarshaling templateParameters: %w", err)
 	}
 
 	// If we got to this point, we can assume that all the keys up to the BMC details
 	// exists since ClusterInstance has nodes mandatory.
-	nodesInterface, nodesExist := inputData["nodes"]
+	nodesInterface, nodesExist := clusterTemplateInputParams[utils.TemplateParamClusterInstance].(map[string]any)["nodes"]
 	if !nodesExist {
 		// Unlikely to happen
 		return utils.NewInputError(
@@ -1450,84 +1717,14 @@ func (t *provisioningRequestReconcilerTask) createClusterInstanceBMCSecrets( // 
 	return nil
 }
 
-// copyHwMgrPluginBMCSecret copies the BMC secret from the plugin namespace to the cluster namespace
-func (t *provisioningRequestReconcilerTask) copyHwMgrPluginBMCSecret(ctx context.Context, name, sourceNamespace, targetNamespace string) error {
-
-	// if the secret already exists in the target namespace, do nothing
-	secret := &corev1.Secret{}
-	exists, err := utils.DoesK8SResourceExist(
-		ctx, t.client, name, targetNamespace, secret)
-	if err != nil {
-		return fmt.Errorf("failed to check if secret exists in namespace %s: %w", targetNamespace, err)
-	}
-	if exists {
-		t.logger.Info(
-			"BMC secret already exists in the cluster namespace",
-			slog.String("name", name),
-			slog.String("name", targetNamespace),
-		)
-		return nil
-	}
-
-	if err := utils.CopyK8sSecret(ctx, t.client, name, sourceNamespace, targetNamespace); err != nil {
-		return fmt.Errorf("failed to copy Kubernetes secret: %w", err)
-	}
-
-	return nil
-}
-
-// createHwMgrPluginNamespace creates the namespace of the hardware manager plugin
-// where the node pools resource resides
-func (t *provisioningRequestReconcilerTask) createHwMgrPluginNamespace(
-	ctx context.Context, name string) error {
-
-	t.logger.InfoContext(
-		ctx,
-		"Plugin: "+fmt.Sprintf("%v", name),
-	)
-
-	// Create the namespace.
-	namespace := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
-	}
-	if err := utils.CreateK8sCR(ctx, t.client, namespace, nil, utils.UPDATE); err != nil {
-		return fmt.Errorf("failed to create Kubernetes CR for namespace %s: %w", namespace, err)
-	}
-
-	return nil
-}
-
-func (t *provisioningRequestReconcilerTask) hwMgrPluginNamespaceExists(
-	ctx context.Context, name string) (bool, error) {
-
-	t.logger.InfoContext(
-		ctx,
-		"Plugin: "+fmt.Sprintf("%v", name),
-	)
-
-	namespace := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
-	}
-	exists, err := utils.DoesK8SResourceExist(ctx, t.client, name, "", namespace)
-	if err != nil {
-		return false, fmt.Errorf("failed check if namespace exists %s: %w", name, err)
-	}
-
-	return exists, nil
-}
-
 func (t *provisioningRequestReconcilerTask) createNodePoolResources(ctx context.Context, nodePool *hwv1alpha1.NodePool) error {
 	// Create the hardware plugin namespace.
 	pluginNameSpace := nodePool.ObjectMeta.Namespace
-	if exists, err := t.hwMgrPluginNamespaceExists(ctx, pluginNameSpace); err != nil {
+	if exists, err := utils.HwMgrPluginNamespaceExists(ctx, t.client, pluginNameSpace); err != nil {
 		return fmt.Errorf("failed check if hardware manager plugin namespace exists %s, err: %w", pluginNameSpace, err)
 	} else if !exists && (pluginNameSpace == utils.TempDellPluginNamespace || pluginNameSpace == utils.UnitTestHwmgrNamespace) {
 		// TODO: For test purposes only. Code to be removed once hwmgr plugin(s) are fully utilized
-		createErr := t.createHwMgrPluginNamespace(ctx, pluginNameSpace)
+		createErr := utils.CreateHwMgrPluginNamespace(ctx, t.client, pluginNameSpace)
 		if createErr != nil {
 			return fmt.Errorf(
 				"failed to create hardware manager plugin namespace %s, err: %w", pluginNameSpace, createErr)
@@ -1610,33 +1807,6 @@ func (t *provisioningRequestReconcilerTask) getCrClusterTemplateRef(ctx context.
 		fmt.Sprintf(
 			"a valid (%s) ClusterTemplate does not exist in any namespace",
 			clusterTemplateRefName))
-}
-
-// validateClusterTemplateInputMatchesSchema validates if the given clusterTemplateInput matches the
-// provided templateParameterSchema of the ClusterTemplate
-func (t *provisioningRequestReconcilerTask) validateClusterTemplateInputMatchesSchema(
-	clusterTemplateInputSchema *runtime.RawExtension, clusterTemplateInput map[string]any, dataType string) error {
-	// Get the schema
-	schemaMap := make(map[string]any)
-	err := json.Unmarshal(clusterTemplateInputSchema.Raw, &schemaMap)
-	if err != nil {
-		return fmt.Errorf("error marshaling the ClusterTemplate schema data: %w", err)
-	}
-	if dataType == utils.ClusterInstanceDataType {
-		utils.DisallowUnknownFieldsInSchema(schemaMap)
-	}
-
-	// Check that the clusterTemplateInput matches the templateParameterSchema from the ClusterTemplate.
-	clusterTemplateRefName := getClusterTemplateRefName(
-		t.object.Spec.TemplateName, t.object.Spec.TemplateVersion)
-	err = utils.ValidateJsonAgainstJsonSchema(
-		schemaMap, clusterTemplateInput)
-	if err != nil {
-		return fmt.Errorf("the provided clusterTemplateInput for %s does not "+
-			"match the schema from the ClusterTemplate (%s): %w", dataType, clusterTemplateRefName, err)
-	}
-
-	return nil
 }
 
 // createPoliciesConfigMap creates the cluster ConfigMap which will be used
@@ -1810,22 +1980,22 @@ func (t *provisioningRequestReconcilerTask) checkNodePoolProvisionStatus(ctx con
 
 // updateClusterInstance updates the given ClusterInstance object based on the provisioned nodePool.
 func (t *provisioningRequestReconcilerTask) updateClusterInstance(ctx context.Context,
-	clusterInstance *siteconfig.ClusterInstance, nodePool *hwv1alpha1.NodePool) bool {
+	clusterInstance *siteconfig.ClusterInstance, nodePool *hwv1alpha1.NodePool) error {
 
-	hwNodes := t.collectNodeDetails(ctx, nodePool)
-	if hwNodes == nil {
-		return false
+	hwNodes, err := utils.CollectNodeDetails(ctx, t.client, nodePool)
+	if err != nil {
+		return fmt.Errorf("failed to collect hardware node %s details for node pool: %w", nodePool.GetName(), err)
 	}
 
-	if !t.copyBMCSecrets(ctx, hwNodes, nodePool) {
-		return false
+	if err := utils.CopyBMCSecrets(ctx, t.client, hwNodes, nodePool); err != nil {
+		return fmt.Errorf("failed to copy BMC secret: %w", err)
 	}
 
-	if !t.applyNodeConfiguration(ctx, hwNodes, nodePool, clusterInstance) {
-		return false
+	if err := t.applyNodeConfiguration(ctx, hwNodes, nodePool, clusterInstance); err != nil {
+		return fmt.Errorf("failed to apply node config to the cluster instance: %w", err)
 	}
 
-	return true
+	return nil
 }
 
 // waitForHardwareData waits for the NodePool to be provisioned and update BMC details
@@ -1843,101 +2013,16 @@ func (t *provisioningRequestReconcilerTask) waitForHardwareData(ctx context.Cont
 				nodePool.GetNamespace(),
 			),
 		)
-		if !t.updateClusterInstance(ctx, clusterInstance, nodePool) {
-			err = fmt.Errorf("failed to update the rendered cluster instance")
+		if err = t.updateClusterInstance(ctx, clusterInstance, nodePool); err != nil {
+			err = fmt.Errorf("failed to update the rendered cluster instance: %w", err)
 		}
 	}
 	return provisioned, timedOutOrFailed, err
 }
 
-// collectNodeDetails collects BMC and node interfaces details
-func (t *provisioningRequestReconcilerTask) collectNodeDetails(ctx context.Context,
-	nodePool *hwv1alpha1.NodePool) map[string][]nodeInfo {
-
-	// hwNodes maps a group name to a slice of NodeInfo
-	hwNodes := make(map[string][]nodeInfo)
-
-	for _, nodeName := range nodePool.Status.Properties.NodeNames {
-		node := &hwv1alpha1.Node{}
-		exists, err := utils.DoesK8SResourceExist(ctx, t.client, nodeName, nodePool.Namespace, node)
-		if err != nil {
-			t.logger.ErrorContext(
-				ctx,
-				"Failed to get the Node object",
-				slog.String("name", nodeName),
-				slog.String("namespace", nodePool.Namespace),
-				slog.String("error", err.Error()),
-				slog.Bool("exists", exists),
-			)
-			return nil
-		}
-		if !exists {
-			t.logger.ErrorContext(
-				ctx,
-				"Node object does not exist",
-				slog.String("name", nodeName),
-				slog.String("namespace", nodePool.Namespace),
-				slog.Bool("exists", exists),
-			)
-			return nil
-		}
-		// Verify the node object is generated from the expected pool
-		if node.Spec.NodePool != nodePool.GetName() {
-			t.logger.ErrorContext(
-				ctx,
-				"Node object is not from the expected NodePool",
-				slog.String("name", node.GetName()),
-				slog.String("pool", nodePool.GetName()),
-			)
-			return nil
-		}
-
-		if node.Status.BMC == nil {
-			t.logger.ErrorContext(
-				ctx,
-				"Node status does not have BMC details",
-				slog.String("name", node.GetName()),
-				slog.String("pool", nodePool.GetName()),
-			)
-			return nil
-		}
-		// Store the nodeInfo per group
-		hwNodes[node.Spec.GroupName] = append(hwNodes[node.Spec.GroupName], nodeInfo{
-			bmcAddress:     node.Status.BMC.Address,
-			bmcCredentials: node.Status.BMC.CredentialsName,
-			nodeName:       node.Name,
-			interfaces:     node.Status.Interfaces,
-		})
-	}
-
-	return hwNodes
-}
-
-// copyBMCSecrets copies BMC secrets from the plugin namespace to the cluster namespace.
-func (t *provisioningRequestReconcilerTask) copyBMCSecrets(ctx context.Context, hwNodes map[string][]nodeInfo,
-	nodePool *hwv1alpha1.NodePool) bool {
-
-	for _, nodeInfos := range hwNodes {
-		for _, node := range nodeInfos {
-			err := t.copyHwMgrPluginBMCSecret(ctx, node.bmcCredentials, nodePool.GetNamespace(), nodePool.GetName())
-			if err != nil {
-				t.logger.ErrorContext(
-					ctx,
-					"Failed to copy BMC secret from the plugin namespace to the cluster namespace",
-					slog.String("name", node.bmcCredentials),
-					slog.String("plugin", nodePool.GetNamespace()),
-					slog.String("cluster", nodePool.GetName()),
-				)
-				return false
-			}
-		}
-	}
-	return true
-}
-
 // applyNodeConfiguration updates the clusterInstance with BMC details, interface MACAddress and bootMACAddress
-func (t *provisioningRequestReconcilerTask) applyNodeConfiguration(ctx context.Context, hwNodes map[string][]nodeInfo,
-	nodePool *hwv1alpha1.NodePool, clusterInstance *siteconfig.ClusterInstance) bool {
+func (t *provisioningRequestReconcilerTask) applyNodeConfiguration(ctx context.Context, hwNodes map[string][]utils.NodeInfo,
+	nodePool *hwv1alpha1.NodePool, clusterInstance *siteconfig.ClusterInstance) error {
 
 	for i, node := range clusterInstance.Spec.Nodes {
 		// Check if the node's role matches any key in hwNodes
@@ -1946,70 +2031,28 @@ func (t *provisioningRequestReconcilerTask) applyNodeConfiguration(ctx context.C
 			continue
 		}
 
-		clusterInstance.Spec.Nodes[i].BmcAddress = nodeInfos[0].bmcAddress
-		clusterInstance.Spec.Nodes[i].BmcCredentialsName = siteconfig.BmcCredentialsName{Name: nodeInfos[0].bmcCredentials}
+		clusterInstance.Spec.Nodes[i].BmcAddress = nodeInfos[0].BmcAddress
+		clusterInstance.Spec.Nodes[i].BmcCredentialsName = siteconfig.BmcCredentialsName{Name: nodeInfos[0].BmcCredentials}
 		// Get the boot MAC address based on the interface label
-		bootMAC, err := utils.GetBootMacAddress(nodeInfos[0].interfaces, nodePool)
+		bootMAC, err := utils.GetBootMacAddress(nodeInfos[0].Interfaces, nodePool)
 		if err != nil {
-			t.logger.ErrorContext(
-				ctx,
-				"Fail to get the node boot MAC address",
-				slog.String("name", node.HostName),
-				slog.String("error", err.Error()),
-			)
-			return false
+			return fmt.Errorf("failed to get the node boot MAC address: %w", err)
 		}
 		clusterInstance.Spec.Nodes[i].BootMACAddress = bootMAC
 
 		// Populate the MAC address for each interface
-		for j, iface := range clusterInstance.Spec.Nodes[i].NodeNetwork.Interfaces {
-			for _, nodeIface := range nodeInfos[0].interfaces {
-				if nodeIface.Name == iface.Name {
-					clusterInstance.Spec.Nodes[i].NodeNetwork.Interfaces[j].MacAddress = nodeIface.MACAddress
-				}
-			}
+		if err := utils.AssignMacAddress(t.clusterInput.clusterInstanceData, nodeInfos[0].Interfaces, &clusterInstance.Spec.Nodes[i]); err != nil {
+			return fmt.Errorf("failed to assign mac address:  %w", err)
 		}
 
 		// Indicates which host has been assigned to the node
-		if !t.updateNodeStatusWithHostname(ctx, nodeInfos[0].nodeName, node.HostName,
-			nodePool.Namespace) {
-			return false
+		if err := utils.UpdateNodeStatusWithHostname(ctx, t.client, nodeInfos[0].NodeName, node.HostName,
+			nodePool.Namespace); err != nil {
+			return fmt.Errorf("failed to update the node status: %w", err)
 		}
 		hwNodes[node.Role] = nodeInfos[1:]
 	}
-	return true
-}
-
-// Updates the Node status with the hostname after BMC information has been assigned.
-func (t *provisioningRequestReconcilerTask) updateNodeStatusWithHostname(ctx context.Context, nodeName, hostname, namespace string) bool {
-	node := &hwv1alpha1.Node{}
-	exists, err := utils.DoesK8SResourceExist(ctx, t.client, nodeName, namespace, node)
-	if err != nil || !exists {
-		t.logger.ErrorContext(
-			ctx,
-			"Failed to get the Node object for updating hostname",
-			slog.String("name", nodeName),
-			slog.String("namespace", namespace),
-			slog.String("error", err.Error()),
-			slog.Bool("exists", exists),
-		)
-		return false
-	}
-
-	node.Status.Hostname = hostname
-	err = t.client.Status().Update(ctx, node)
-	if err != nil {
-		t.logger.ErrorContext(
-			ctx,
-			"Failed to update Node status with hostname",
-			slog.String("name", node.GetName()),
-			slog.String("hostname", hostname),
-			slog.String("namespace", namespace),
-			slog.String("error", err.Error()),
-		)
-		return false
-	}
-	return true
+	return nil
 }
 
 // updateHardwareProvisioningStatus updates the status for the ProvisioningRequest
@@ -2050,18 +2093,21 @@ func (t *provisioningRequestReconcilerTask) updateHardwareProvisioningStatus(
 			// Ensure a consistent message for the provisioning request, regardless of which plugin is used.
 			message = "Hardware provisioning failed"
 			timedOutOrFailed = true
+			utils.SetProvisioningStateFailed(t.object, message)
 		}
 	} else {
 		// No provisioning condition found, set the status to unknown.
 		status = metav1.ConditionUnknown
 		reason = string(utils.CRconditionReasons.Unknown)
 		message = "Unknown state of hardware provisioning"
+		utils.SetProvisioningStateInProgress(t.object, message)
 	}
 
 	// Check for timeout if not already failed or provisioned
 	if status != metav1.ConditionTrue && reason != string(hwv1alpha1.Failed) {
-		elapsedTime := time.Since(t.object.Status.NodePoolRef.HardwareProvisioningCheckStart.Time)
-		if elapsedTime >= time.Duration(t.object.Spec.Timeout.HardwareProvisioning)*time.Minute {
+		if utils.TimeoutExceeded(
+			t.object.Status.NodePoolRef.HardwareProvisioningCheckStart.Time,
+			t.timeouts.hardwareProvisioning) {
 			t.logger.InfoContext(
 				ctx,
 				fmt.Sprintf(
@@ -2074,6 +2120,9 @@ func (t *provisioningRequestReconcilerTask) updateHardwareProvisioningStatus(
 			message = "Hardware provisioning timed out"
 			status = metav1.ConditionFalse
 			timedOutOrFailed = true
+			utils.SetProvisioningStateFailed(t.object, message)
+		} else {
+			utils.SetProvisioningStateInProgress(t.object, "Hardware provisioning is in progress")
 		}
 	}
 
